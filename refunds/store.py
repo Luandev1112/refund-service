@@ -22,6 +22,21 @@ class Table:
             raise ConditionalCheckFailed(item["pk"])
         self._items[item["pk"]] = copy.deepcopy(item)
 
+    def transact_write(self, puts, adds=()):
+        """Like TransactWriteItems. puts is a list of (item, only_if_new) pairs.
+        adds is a list of (pk, attribute, delta) triples, like UpdateExpression="ADD attribute :delta":
+        the number changes by delta, and a missing item or attribute starts at 0.
+        Every condition is checked first. If any fails, nothing is saved and
+        ConditionalCheckFailed is raised. Otherwise every put and add is applied."""
+        for item, only_if_new in puts:
+            if only_if_new and item["pk"] in self._items:
+                raise ConditionalCheckFailed(item["pk"])
+        for item, _ in puts:
+            self._items[item["pk"]] = copy.deepcopy(item)
+        for pk, attribute, delta in adds:
+            item = self._items.setdefault(pk, {"pk": pk})
+            item[attribute] = item.get(attribute, 0) + delta
+
     def get_item(self, pk):
         """Return a copy of the item with that key, or None."""
         item = self._items.get(pk)

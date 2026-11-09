@@ -3,7 +3,7 @@ Lambda retries it with the same request_id."""
 
 import uuid
 
-from .store import Cache, Table
+from .store import Cache, ConditionalCheckFailed, Table
 
 
 class RefundService:
@@ -14,13 +14,24 @@ class RefundService:
     def create_refund(self, request_id: str, merchant_id: str, amount_cents: int) -> str:
         """Refund amount_cents from the merchant's balance and return the refund id."""
         refund_id = str(uuid.uuid4())
-        self.table.put_item({
-            "pk": f"refund#{refund_id}",
-            "request_id": request_id,
-            "merchant_id": merchant_id,
-            "amount_cents": amount_cents,
-        })
-        self._add_to_balance(merchant_id, -amount_cents)
+        # One transaction: the request marker, the refund and the balance change are saved together or not at all.
+        # The balance uses an atomic ADD, so two refunds for one merchant never overwrite each other.
+        try:
+            self.table.transact_write(
+                puts=[
+                    ({"pk": f"request#{request_id}", "refund_id": refund_id}, True),
+                    ({
+                        "pk": f"refund#{refund_id}",
+                        "request_id": request_id,
+                        "merchant_id": merchant_id,
+                        "amount_cents": amount_cents,
+                    }, False),
+                ],
+                adds=[(f"merchant#{merchant_id}", "balance_cents", -amount_cents)],
+            )
+        except ConditionalCheckFailed:
+            return self.table.get_item(f"request#{request_id}")["refund_id"]
+        self.cache.delete(f"balance:{merchant_id}")
         return refund_id
 
     def balance(self, merchant_id: str) -> int:
@@ -36,8 +47,3 @@ class RefundService:
 
     def refunds_for(self, merchant_id: str) -> list:
         return [r for r in self.table.query("refund#") if r["merchant_id"] == merchant_id]
-
-    def _add_to_balance(self, merchant_id: str, delta_cents: int) -> None:
-        item = self.table.get_item(f"merchant#{merchant_id}") or {"pk": f"merchant#{merchant_id}", "balance_cents": 0}
-        item["balance_cents"] += delta_cents
-        self.table.put_item(item)
